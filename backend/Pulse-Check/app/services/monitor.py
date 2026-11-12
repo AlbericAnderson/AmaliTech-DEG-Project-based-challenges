@@ -3,7 +3,6 @@ import logging
 
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,9 +21,7 @@ def utc_now() -> datetime:
 
 def normalize_utc(value: datetime) -> datetime:
     """
-    SQLite may return timezone-naive datetimes.
-
-    Interpret naive values as UTC.
+    Normalize a datetime to UTC timezone.
     """
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
@@ -44,6 +41,8 @@ def trigger_alert(monitor: Monitor) -> None:
 
     logger.critical(json.dumps(alert))
 
+
+# Custom exceptions for monitor operations.
 
 class MonitorNotFoundError(Exception):
     pass
@@ -196,7 +195,7 @@ class MonitorService:
 
         if monitor.status == "DOWN":
             raise MonitorStateError(
-                "Monitor is DOWN. Manual recovery is required."
+                "Monitor is DOWN."
             )
 
         raise MonitorStateError(
@@ -216,6 +215,46 @@ class MonitorService:
                 f"Monitor {monitor_id} not found."
             )
 
+        now = utc_now()
+
+        # Calculate remaining time from the current deadline.
+
+        expires_at = normalize_utc(monitor.expires_at)
+
+        remaining = max(
+            0.0,
+            (expires_at - now).total_seconds()
+        )
+
+        # Pause the monitor if it is ACTIVE and has not expired.
+
+        result = await db.execute(
+            update(Monitor)
+            .where(
+                Monitor.id == monitor_id,
+                Monitor.status == "ACTIVE",
+                Monitor.expires_at > now,
+            )
+            .values(
+                status="PAUSED",
+                remaining_seconds=remaining,
+            )
+            .execution_options(
+                synchronize_session=False
+            )
+        )
+
+        if result.rowcount == 1:
+
+            await db.commit()
+            await db.refresh(monitor)
+
+            return monitor
+
+        # The state changed before the update
+
+        await db.refresh(monitor)
+
         if monitor.status == "DOWN":
             raise MonitorStateError(
                 "Cannot pause a DOWN monitor."
@@ -226,15 +265,30 @@ class MonitorService:
                 "Monitor is already paused."
             )
 
-        now = utc_now()
+        # Monitor still ACTIVE, but its deadline has passed.
+        # Attempt to mark as expired.
 
-        expires_at = normalize_utc(monitor.expires_at)
+        transition = await db.execute(
+            update(Monitor)
+            .where(
+                Monitor.id == monitor_id,
+                Monitor.status == "ACTIVE",
+                Monitor.expires_at <= now,
+                Monitor.alerted_at.is_(None),
+            )
+            .values(
+                status="DOWN",
+                alerted_at=now,
+            )
+            .execution_options(
+                synchronize_session=False
+            )
+        )
 
-        if now >= expires_at:
-            monitor.status = "DOWN"
-            monitor.alerted_at = now
+        if transition.rowcount == 1:
 
             await db.commit()
+            await db.refresh(monitor)
 
             trigger_alert(monitor)
 
@@ -242,18 +296,16 @@ class MonitorService:
                 f"Monitor {monitor_id} has expired."
             )
 
-        remaining = max(
-            0.0,
-            (expires_at - now).total_seconds()
-        )
-
-        monitor.status = "PAUSED"
-        monitor.remaining_seconds = remaining
-
-        await db.commit()
         await db.refresh(monitor)
 
-        return monitor
+        if monitor.status == "DOWN":
+            raise MonitorStateError(
+                "Cannot pause a DOWN monitor."
+            )
+
+        raise MonitorStateError(
+            "Monitor state changed during pause operation."
+        )
 
     @staticmethod
     async def get_monitor(
