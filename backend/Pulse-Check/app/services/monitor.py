@@ -10,6 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database.models import Monitor
 from app.schemas.monitor import MonitorCreate
 
+from sqlalchemy import update, and_, or_
+
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +102,7 @@ class MonitorService:
 
         return monitor
 
+
     @staticmethod
     async def heartbeat(
         db: AsyncSession,
@@ -115,19 +118,73 @@ class MonitorService:
 
         now = utc_now()
 
-        if monitor.status == "DOWN":
-            raise MonitorStateError(
-                "Monitor is DOWN. Manual recovery is required."
+        # we accept the heartbeat if:
+        # 1. The monitor is ACTIVE and hasn't expired, OR
+        # 2. The monitor is PAUSED.
+
+        result = await db.execute(
+            update(Monitor)
+            .where(
+                Monitor.id == monitor_id,
+                or_(
+                    and_(
+                        Monitor.status == "ACTIVE",
+                        Monitor.expires_at > now,
+                    ),
+                    Monitor.status == "PAUSED",
+                ),
             )
+            .values(
+                status="ACTIVE",
+                last_heartbeat_at=now,
+                expires_at=now + timedelta(
+                    seconds=monitor.timeout
+                ),
+                remaining_seconds=None,
+            )
+            .execution_options(
+                synchronize_session=False
+            )
+        )
+
+        if result.rowcount == 1:
+
+            await db.commit()
+
+            await db.refresh(monitor)
+
+            return monitor
+
+        # The heartbeat was not accepted.
+
+        await db.refresh(monitor)
 
         if monitor.status == "ACTIVE":
-            expires_at = normalize_utc(monitor.expires_at)
 
-            if now >= expires_at:
-                monitor.status = "DOWN"
-                monitor.alerted_at = now
+            # Expired before the initial attempt to update. Attempt to transition to DOWN.
+
+            transition = await db.execute(
+                update(Monitor)
+                .where(
+                    Monitor.id == monitor_id,
+                    Monitor.status == "ACTIVE",
+                    Monitor.expires_at <= now,
+                    Monitor.alerted_at.is_(None),
+                )
+                .values(
+                    status="DOWN",
+                    alerted_at=now,
+                )
+                .execution_options(
+                    synchronize_session=False
+                )
+            )
+
+            if transition.rowcount == 1:
 
                 await db.commit()
+
+                await db.refresh(monitor)
 
                 trigger_alert(monitor)
 
@@ -135,20 +192,16 @@ class MonitorService:
                     f"Monitor {monitor_id} has expired."
                 )
 
-        # A heartbeat resets the timer.
-        # If PAUSED, it also automatically resumes monitoring.
+            await db.refresh(monitor)
 
-        monitor.status = "ACTIVE"
-        monitor.last_heartbeat_at = now
-        monitor.expires_at = now + timedelta(
-            seconds=monitor.timeout
+        if monitor.status == "DOWN":
+            raise MonitorStateError(
+                "Monitor is DOWN. Manual recovery is required."
+            )
+
+        raise MonitorStateError(
+            "Heartbeat could not be processed due to a state change."
         )
-        monitor.remaining_seconds = None
-
-        await db.commit()
-        await db.refresh(monitor)
-
-        return monitor
 
     @staticmethod
     async def pause(
