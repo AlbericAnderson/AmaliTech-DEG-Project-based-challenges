@@ -1,6 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
+
 from app.database.database import get_db
 from app.schemas.monitor import (
     MonitorCreate,
@@ -21,11 +24,27 @@ router = APIRouter()
 
 
 @router.get("/health", tags=["Health"])
-async def health_check():
-    return {
-        "status": "healthy",
-        "application": "Pulse Check API",
-    }
+async def health_check(
+    db: AsyncSession = Depends(get_db),
+):
+
+    try:
+        await db.execute(text("SELECT 1"))
+
+        return {
+            "status": "healthy",
+            "application": "Pulse Check API",
+            "database": "connected",
+        }
+
+    except SQLAlchemyError:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "unhealthy",
+                "database": "unavailable",
+            },
+        )
 
 
 @router.post(

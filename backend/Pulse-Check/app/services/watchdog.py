@@ -23,8 +23,13 @@ def utc_now() -> datetime:
 
 class Watchdog:
 
-    def __init__(self, interval: float = 1.0):
+    def __init__(
+        self,
+        interval: float = 1.0,
+        session_factory=AsyncSessionLocal,
+    ):
         self.interval = interval
+        self.session_factory = session_factory
         self.running = False
 
     async def check_expired_monitors(self):
@@ -34,7 +39,7 @@ class Watchdog:
 
         now = utc_now()
 
-        async with AsyncSessionLocal() as db:
+        async with self.session_factory() as db:
 
             # Find potentially expired monitors.
 
